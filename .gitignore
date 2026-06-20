@@ -34,6 +34,7 @@
 *.bak
 
 # Configuración local
+.env
 config.local.toml
 settings.local.toml
 
