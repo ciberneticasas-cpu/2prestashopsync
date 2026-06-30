@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Write};
 use std::time::Instant;
 
-use chrono::Local;
+use chrono::{Duration, Local, NaiveDate, NaiveDateTime};
 use futures_util::stream::StreamExt;
 use mysql_async::{params, prelude::*, Pool};
 use tiberius::{Client, Config};
@@ -15,6 +15,11 @@ use tokio_util::compat::TokioAsyncWriteCompatExt;
 const DB_PREFIX: &str = "ps_";
 const LOCAL_SYNC_CONFIG: &str = "/opt/2prestashopsync/sync_config.env";
 const LOCAL_ENV_CONFIG: &str = "/opt/2prestashopsync/.env";
+const DEFAULT_ERP_GROUP_NAME: &str = "SINGRUPO";
+const DEFAULT_NEW_PRODUCT_WINDOW_DAYS: i64 = 30;
+const DEFAULT_INSERT_TOP_PERCENT: f64 = 0.50;
+const DEFAULT_WITHDRAW_BOTTOM_PERCENT: f64 = 0.05;
+const PROTECTED_MARIADB_HOSTS: [&str; 2] = ["www.mercaboy.com", "192.168.0.231"];
 const DEFAULT_AUDIT_HOSTS: [&str; 2] = ["192.168.0.231", "192.168.123.231"];
 
 #[derive(Debug)]
@@ -49,7 +54,7 @@ struct ErpStock {
 #[derive(Debug, Clone)]
 struct ErpItem {
     productoid: String,
-    ean13: String,
+    ean_keys: Vec<String>,
     reference: String,
     name: String,
     qty: f64,
@@ -58,6 +63,7 @@ struct ErpItem {
     pum_unit: String,
     sales_price: Option<f64>,
     price_lists: String,
+    created_at: String,
     erp_group_level_1: String,
     erp_group_level_2: String,
     erp_group_level_4: String,
@@ -136,6 +142,8 @@ struct ProductInsert {
     final_qty: i32,
     final_price: f64,
     final_pum: Option<PumUpdate>,
+    category_path: Vec<String>,
+    proposal_reason: String,
 }
 
 #[derive(Debug)]
@@ -173,6 +181,11 @@ struct AuditRow {
     last_purchase_date: String,
     last_purchase_qty: String,
     last_purchase_value: String,
+    erp_created_at: String,
+    income: f64,
+    contribution: f64,
+    contribution_score: f64,
+    proposal_reason: String,
     action: String,
 }
 
@@ -181,6 +194,23 @@ struct PurchaseInfo {
     date: String,
     qty: String,
     value: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ContributionInfo {
+    productoid: String,
+    name: String,
+    reference: String,
+    ean13: String,
+    income: f64,
+    cost: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PrestashopCategoryPath {
+    group: String,
+    subgroup: String,
+    tokens: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -203,7 +233,6 @@ struct PrestashopContext {
     id_shop: u32,
     id_lang: u32,
     id_category_home: u32,
-    id_category_root: u32,
     id_groups: Vec<u32>,
 }
 
@@ -244,6 +273,13 @@ fn read_local_config() -> HashMap<String, String> {
     read_key_value_file(LOCAL_ENV_CONFIG, &mut values);
 
     values
+}
+
+fn is_protected_mariadb_host(host: &str) -> bool {
+    let host = host.trim().to_lowercase();
+    PROTECTED_MARIADB_HOSTS
+        .iter()
+        .any(|protected| host == *protected)
 }
 
 fn parse_hosts(value: Option<&String>, sync_host: &str) -> Vec<String> {
@@ -328,6 +364,38 @@ async fn load_erp_stock(
     tcp.set_nodelay(true)?;
 
     let mut mssql_client = Client::connect(mssql_config, tcp.compat_write()).await?;
+    let mut columns_stream = mssql_client
+        .query(
+            "SELECT TABLE_NAME, COLUMN_NAME \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_NAME IN ('HeadProd', 'Producto')",
+            &[],
+        )
+        .await?;
+    let mut headprod_columns = HashSet::new();
+    let mut product_columns = HashSet::new();
+    while let Some(row_result) = columns_stream.next().await {
+        let item = row_result?;
+        if let tiberius::QueryItem::Row(row) = item {
+            let table = row.get::<&str, _>("TABLE_NAME").unwrap_or("").trim();
+            let column = row
+                .get::<&str, _>("COLUMN_NAME")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if column.is_empty() {
+                continue;
+            }
+            if table.eq_ignore_ascii_case("HeadProd") {
+                headprod_columns.insert(column);
+            } else if table.eq_ignore_ascii_case("Producto") {
+                product_columns.insert(column);
+            }
+        }
+    }
+    drop(columns_stream);
+
+    let created_expr = select_erp_created_expression(&headprod_columns, &product_columns);
 
     let mssql_query = format!(
         "SELECT \
@@ -345,6 +413,7 @@ async fn load_erp_stock(
             CONCAT(TRIM(hp.grupoiv), CASE WHEN COALESCE(TRIM(g4.nombre), '') <> '' THEN CONCAT(' ', TRIM(g4.nombre)) ELSE '' END) AS GrupoNivel4, \
             CONCAT(TRIM(hp.grupovi), CASE WHEN COALESCE(TRIM(g6.nombre), '') <> '' THEN CONCAT(' ', TRIM(g6.nombre)) ELSE '' END) AS GrupoNivel6, \
             CONCAT(TRIM(hp.Grupo7), CASE WHEN COALESCE(TRIM(g7.nombre), '') <> '' THEN CONCAT(' ', TRIM(g7.nombre)) ELSE '' END) AS GrupoNivel7, \
+            {created_expr} AS FechaCreacionERP, \
             CAST(p.valor AS VARCHAR(40)) AS PrecioVenta, \
             CAST(SUM(COALESCE(ip.invenactua, 0)) AS VARCHAR(40)) AS InventarioUnidades \
          FROM Producto p \
@@ -355,8 +424,9 @@ async fn load_erp_stock(
          LEFT JOIN Grupo g6 ON g6.grupoid = hp.grupovi AND g6.nivel = 6 \
          LEFT JOIN Grupo g7 ON g7.grupoid = hp.Grupo7 AND g7.nivel = 7 \
          LEFT JOIN InveProd ip ON ip.productoid = p.productoid AND ip.almacenid IN ({}) \
-         GROUP BY p.productoid, p.barras, p.barras2, p.Barras3, hp.referencia, hp.nombre, hp.unidad, hp.PUMContenidoInterno, hp.PUMUnidadMedida, hp.grupoi, g1.nombre, hp.grupoii, g2.nombre, hp.grupoiv, g4.nombre, hp.grupovi, g6.nombre, hp.Grupo7, g7.nombre, p.valor",
-        almacenes_in_clause
+         GROUP BY p.productoid, p.barras, p.barras2, p.Barras3, hp.referencia, hp.nombre, hp.unidad, hp.PUMContenidoInterno, hp.PUMUnidadMedida, hp.grupoi, g1.nombre, hp.grupoii, g2.nombre, hp.grupoiv, g4.nombre, hp.grupovi, g6.nombre, hp.Grupo7, g7.nombre, p.valor, {created_expr}",
+        almacenes_in_clause,
+        created_expr = created_expr
     );
 
     let mut select_stream = mssql_client.query(mssql_query, &[]).await?;
@@ -435,6 +505,11 @@ async fn load_erp_stock(
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let created_at = row
+                .get::<&str, _>("FechaCreacionERP")
+                .unwrap_or("")
+                .trim()
+                .to_string();
             let sales_price = row
                 .get::<&str, _>("PrecioVenta")
                 .and_then(|value| value.trim().replace(',', ".").parse::<f64>().ok());
@@ -448,13 +523,14 @@ async fn load_erp_stock(
                 product_ids.insert(productoid.clone());
             }
 
+            let ean_keys = vec![ean.clone(), ean2, ean3];
             records.push((
-                vec![ean.clone(), ean2, ean3],
+                ean_keys.clone(),
                 productoid.clone(),
                 reference.clone(),
                 ErpItem {
                     productoid,
-                    ean13: ean.clone(),
+                    ean_keys,
                     reference: reference.clone(),
                     name,
                     qty,
@@ -463,6 +539,7 @@ async fn load_erp_stock(
                     pum_unit,
                     sales_price,
                     price_lists: String::new(),
+                    created_at,
                     erp_group_level_1,
                     erp_group_level_2,
                     erp_group_level_4,
@@ -608,6 +685,130 @@ fn select_purchase_value_expression(columns: &HashSet<String>) -> String {
     "''".to_string()
 }
 
+fn select_movement_amount_expression(columns: &HashSet<String>) -> String {
+    let candidates = [
+        "venta",
+        "valor",
+        "valortotal",
+        "valor_total",
+        "importe",
+        "importetotal",
+        "importe_total",
+        "total",
+        "totallinea",
+        "valorlinea",
+        "valor_linea",
+    ];
+
+    for candidate in candidates {
+        if let Some(column) = columns
+            .iter()
+            .find(|column| column.eq_ignore_ascii_case(candidate))
+        {
+            return format!("CAST(m.{} AS DECIMAL(18,4))", bracket_identifier(column));
+        }
+    }
+
+    "CAST(0 AS DECIMAL(18,4))".to_string()
+}
+
+fn select_movement_cost_expression(columns: &HashSet<String>) -> String {
+    let candidates = [
+        "costo",
+        "costototal",
+        "costo_total",
+        "costolinea",
+        "costo_linea",
+        "costounitario",
+        "costo_unitario",
+        "valorcosto",
+        "valor_costo",
+    ];
+
+    for candidate in candidates {
+        if let Some(column) = columns
+            .iter()
+            .find(|column| column.eq_ignore_ascii_case(candidate))
+        {
+            return format!("CAST(m.{} AS DECIMAL(18,4))", bracket_identifier(column));
+        }
+    }
+
+    "CAST(0 AS DECIMAL(18,4))".to_string()
+}
+
+fn select_erp_created_expression(headprod_columns: &HashSet<String>, product_columns: &HashSet<String>) -> String {
+    let headprod_candidates = [
+        "fechacreacion",
+        "fecha_creacion",
+        "fechacrea",
+        "created_at",
+        "date_add",
+        "fechainsercion",
+        "fechaingreso",
+    ];
+    for candidate in headprod_candidates {
+        if let Some(column) = headprod_columns
+            .iter()
+            .find(|column| column.eq_ignore_ascii_case(candidate))
+        {
+            return format!("CONVERT(VARCHAR(19), hp.{}, 120)", bracket_identifier(column));
+        }
+    }
+
+    let product_candidates = [
+        "fechacreacion",
+        "fecha_creacion",
+        "fechacrea",
+        "created_at",
+        "date_add",
+        "fechainsercion",
+        "fechaingreso",
+    ];
+    for candidate in product_candidates {
+        if let Some(column) = product_columns
+            .iter()
+            .find(|column| column.eq_ignore_ascii_case(candidate))
+        {
+            return format!("CONVERT(VARCHAR(19), p.{}, 120)", bracket_identifier(column));
+        }
+    }
+
+    "''".to_string()
+}
+
+fn parse_decimal_cell(row: &tiberius::Row, column: &str) -> f64 {
+    if let Ok(Some(value)) = row.try_get::<tiberius::numeric::Numeric, _>(column) {
+        return value.into();
+    }
+
+    if let Ok(Some(value)) = row.try_get::<&str, _>(column) {
+        return value
+            .trim()
+            .replace(',', ".")
+            .parse::<f64>()
+            .unwrap_or(0.0);
+    }
+
+    if let Ok(Some(value)) = row.try_get::<f64, _>(column) {
+        return value;
+    }
+
+    if let Ok(Some(value)) = row.try_get::<f32, _>(column) {
+        return value as f64;
+    }
+
+    if let Ok(Some(value)) = row.try_get::<i64, _>(column) {
+        return value as f64;
+    }
+
+    if let Ok(Some(value)) = row.try_get::<i32, _>(column) {
+        return value as f64;
+    }
+
+    0.0
+}
+
 async fn load_last_purchase_info(
     host: &str,
     erp: &ErpConnection,
@@ -748,6 +949,113 @@ async fn load_last_purchase_info(
     }
 
     Ok(purchases)
+}
+
+async fn load_contribution_margins(
+    host: &str,
+    erp: &ErpConnection,
+    window_days: i32,
+) -> Result<Vec<ContributionInfo>, Box<dyn Error>> {
+    let mut mssql_config = Config::new();
+    mssql_config.host(host);
+    mssql_config.port(erp.port);
+    mssql_config.authentication(tiberius::AuthMethod::sql_server(&erp.user, &erp.password));
+    mssql_config.database(&erp.database);
+    mssql_config.encryption(tiberius::EncryptionLevel::NotSupported);
+
+    let tcp = TcpStream::connect(mssql_config.get_addr()).await?;
+    tcp.set_nodelay(true)?;
+
+    let mut mssql_client = Client::connect(mssql_config, tcp.compat_write()).await?;
+    let mut columns_stream = mssql_client
+        .query(
+            "SELECT COLUMN_NAME \
+             FROM INFORMATION_SCHEMA.COLUMNS \
+             WHERE TABLE_NAME = 'Movimi'",
+            &[],
+        )
+        .await?;
+    let mut movimi_columns = HashSet::new();
+
+    while let Some(row_result) = columns_stream.next().await {
+        let item = row_result?;
+        if let tiberius::QueryItem::Row(row) = item {
+            let column = row
+                .get::<&str, _>("COLUMN_NAME")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if !column.is_empty() {
+                movimi_columns.insert(column);
+            }
+        }
+    }
+    drop(columns_stream);
+
+    let income_expr = select_movement_amount_expression(&movimi_columns);
+    let cost_expr = select_movement_cost_expression(&movimi_columns);
+    let query = format!(
+        "SELECT \
+            CodigoProducto, NombreProducto, Referencia, Ean13, \
+            SUM(IngresoLinea) AS Ingreso, \
+            SUM(CostoLinea) AS Costo \
+         FROM ( \
+            SELECT \
+                TRIM(p.productoid) AS CodigoProducto, \
+                COALESCE(NULLIF(LTRIM(RTRIM(hp.nombre)), ''), '') AS NombreProducto, \
+                COALESCE(NULLIF(LTRIM(RTRIM(hp.referencia)), ''), '') AS Referencia, \
+                COALESCE(NULLIF(LTRIM(RTRIM(p.barras)), ''), '') AS Ean13, \
+                CASE WHEN d.compra = 'N' THEN {income_expr} ELSE CAST(0 AS DECIMAL(18,4)) END AS IngresoLinea, \
+                CASE WHEN d.compra = 'N' THEN {cost_expr} ELSE CAST(0 AS DECIMAL(18,4)) END AS CostoLinea \
+            FROM Movimi m \
+            JOIN HeadMovi hm ON hm.movimientoid = m.movimientoid \
+            JOIN Producto p ON p.productoid = m.productoid \
+            LEFT JOIN HeadProd hp ON hp.headprodid = p.headprodid \
+            LEFT JOIN Document d ON d.documentoid = hm.documentoid \
+            WHERE hm.fecha >= DATEADD(day, -{window_days}, GETDATE()) \
+         ) mov \
+         GROUP BY CodigoProducto, NombreProducto, Referencia, Ean13 \
+         HAVING SUM(IngresoLinea) <> 0 OR SUM(CostoLinea) <> 0 \
+         ORDER BY SUM(IngresoLinea) DESC, SUM(CostoLinea) DESC, CodigoProducto",
+        income_expr = income_expr,
+        cost_expr = cost_expr,
+        window_days = window_days
+    );
+
+    let mut stream = mssql_client.query(&query, &[]).await?;
+    let mut report = Vec::new();
+
+    while let Some(row_result) = stream.next().await {
+        let item = row_result?;
+        if let tiberius::QueryItem::Row(row) = item {
+            report.push(ContributionInfo {
+                productoid: row
+                    .get::<&str, _>("CodigoProducto")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                name: row
+                    .get::<&str, _>("NombreProducto")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                reference: row
+                    .get::<&str, _>("Referencia")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                ean13: row
+                    .get::<&str, _>("Ean13")
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                income: parse_decimal_cell(&row, "Ingreso"),
+                cost: parse_decimal_cell(&row, "Costo"),
+            });
+        }
+    }
+
+    Ok(report)
 }
 
 async fn inspect_erp_schema(host: &str, erp: &ErpConnection) -> Result<(), Box<dyn Error>> {
@@ -1460,12 +1768,259 @@ fn erp_category_name(value: &str) -> String {
     value.trim().chars().take(128).collect::<String>()
 }
 
+fn is_numeric_erp_category_name(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed
+        .chars()
+        .next()
+        .map(|ch| ch.is_ascii_digit())
+        .unwrap_or(false)
+}
+
+fn strip_erp_category_code(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_code = trimmed
+        .split_once(' ')
+        .filter(|(first, _)| first.chars().any(|ch| ch.is_ascii_digit()))
+        .map(|(_, rest)| rest.trim())
+        .unwrap_or(trimmed);
+    erp_category_name(without_code)
+}
+
+fn contribution_value(info: &ContributionInfo) -> f64 {
+    info.income - info.cost
+}
+
+fn contribution_score(info: &ContributionInfo) -> f64 {
+    info.income * contribution_value(info)
+}
+
+fn parse_date_time(value: &str) -> Option<NaiveDateTime> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+        })
+}
+
+fn is_recent_erp_item(item: &ErpItem, window_days: i64) -> bool {
+    let Some(created_at) = parse_date_time(&item.created_at) else {
+        return false;
+    };
+    created_at >= (Local::now().naive_local() - Duration::days(window_days))
+}
+
+fn proposal_metric_by_product(
+    report: &[ContributionInfo],
+) -> HashMap<String, ContributionInfo> {
+    report
+        .iter()
+        .filter(|row| !row.productoid.trim().is_empty())
+        .map(|row| (row.productoid.clone(), row.clone()))
+        .collect()
+}
+
+fn top_productoids_by_score(report: &[ContributionInfo], top_percent: f64) -> HashSet<String> {
+    let mut scored: Vec<&ContributionInfo> = report
+        .iter()
+        .filter(|row| !row.productoid.trim().is_empty())
+        .collect();
+    scored.sort_by(|a, b| {
+        contribution_score(b)
+            .partial_cmp(&contribution_score(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let limit = ((scored.len() as f64) * top_percent.clamp(0.0, 1.0)).ceil() as usize;
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|row| row.productoid.clone())
+        .collect()
+}
+
+fn bottom_productoids_by_score(report: &[ContributionInfo], bottom_percent: f64) -> HashSet<String> {
+    let mut scored: Vec<&ContributionInfo> = report
+        .iter()
+        .filter(|row| !row.productoid.trim().is_empty())
+        .collect();
+    scored.sort_by(|a, b| {
+        contribution_score(a)
+            .partial_cmp(&contribution_score(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let limit = ((scored.len() as f64) * bottom_percent.clamp(0.0, 1.0)).ceil() as usize;
+    scored
+        .into_iter()
+        .take(limit.max(1))
+        .map(|row| row.productoid.clone())
+        .collect()
+}
+
+fn tokenize_category_text(value: &str) -> HashSet<String> {
+    let stop_words = [
+        "de", "del", "la", "las", "el", "los", "y", "en", "para", "con", "por", "sin",
+        "portafolio", "producto", "productos",
+    ];
+    value
+        .to_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|token| token.len() >= 3 && !stop_words.contains(token))
+        .map(|token| token.to_string())
+        .collect()
+}
+
+fn product_category_tokens(item: &ErpItem) -> HashSet<String> {
+    let mut text = item.name.clone();
+    for group in [
+        &item.erp_group_level_1,
+        &item.erp_group_level_2,
+        &item.erp_group_level_4,
+        &item.erp_group_level_6,
+        &item.erp_group_level_7,
+    ] {
+        text.push(' ');
+        text.push_str(&strip_erp_category_code(group));
+    }
+    tokenize_category_text(&text)
+}
+
+fn inferred_category_path(item: &ErpItem, ps_categories: &[PrestashopCategoryPath]) -> Vec<String> {
+    let product_tokens = product_category_tokens(item);
+    let mut best: Option<(&PrestashopCategoryPath, usize)> = None;
+    for category in ps_categories {
+        let score = product_tokens.intersection(&category.tokens).count();
+        if score == 0 {
+            continue;
+        }
+        if best
+            .as_ref()
+            .map(|(_, best_score)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((category, score));
+        }
+    }
+
+    if let Some((category, _)) = best.filter(|(_, score)| *score >= 2) {
+        if category.subgroup.is_empty() {
+            return vec![category.group.clone()];
+        }
+        return vec![category.group.clone(), category.subgroup.clone()];
+    }
+
+    let clean_groups: Vec<String> = [
+        &item.erp_group_level_1,
+        &item.erp_group_level_2,
+        &item.erp_group_level_4,
+        &item.erp_group_level_6,
+        &item.erp_group_level_7,
+    ]
+    .iter()
+    .map(|group| strip_erp_category_code(group))
+    .filter(|group| !group.is_empty() && !is_numeric_erp_category_name(group))
+    .fold(Vec::new(), |mut groups, group| {
+        if !groups.iter().any(|existing| existing == &group) {
+            groups.push(group);
+        }
+        groups
+    });
+
+    if clean_groups.is_empty() {
+        vec![DEFAULT_ERP_GROUP_NAME.to_string()]
+    } else {
+        clean_groups.into_iter().take(2).collect()
+    }
+}
+
 fn product_reference(item: &ErpItem) -> String {
     if !item.productoid.trim().is_empty() {
         item.productoid.trim().to_string()
     } else {
         item.reference.trim().to_string()
     }
+}
+
+fn erp_item_match_keys(item: &ErpItem) -> Vec<String> {
+    let mut keys = Vec::new();
+    for key in [item.productoid.trim(), item.reference.trim()] {
+        if key.is_empty() {
+            continue;
+        }
+        keys.push(key.to_string());
+        if let Some(normalized) = normalized_numeric_key(key) {
+            keys.push(normalized);
+        }
+    }
+    for key in &item.ean_keys {
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        keys.push(key.to_string());
+        if let Some(normalized) = normalized_numeric_key(key) {
+            keys.push(normalized);
+        }
+    }
+    keys
+}
+
+fn erp_item_valid_ean13(item: &ErpItem) -> String {
+    item.ean_keys
+        .iter()
+        .map(|ean| valid_ean13(ean))
+        .find(|ean| !ean.is_empty())
+        .unwrap_or_default()
+}
+
+fn erp_group_path(item: &ErpItem) -> Vec<String> {
+    let mut groups = Vec::new();
+    for group in [
+        item.erp_group_level_1.as_str(),
+        item.erp_group_level_2.as_str(),
+        item.erp_group_level_4.as_str(),
+        item.erp_group_level_6.as_str(),
+        item.erp_group_level_7.as_str(),
+    ] {
+        let group = erp_category_name(group);
+        if group.is_empty() || groups.iter().any(|existing| existing == &group) {
+            continue;
+        }
+        groups.push(group);
+    }
+
+    if groups.is_empty() {
+        groups.push(DEFAULT_ERP_GROUP_NAME.to_string());
+    }
+
+    groups
+}
+
+fn resolve_pum_update_for_new(
+    erp_item: &ErpItem,
+    final_price: Option<f64>,
+    plan: &HashMap<String, PumSeed>,
+) -> Option<PumUpdate> {
+    let price = final_price?;
+    let seed = find_pum_plan_seed(plan, &erp_item.reference, &erp_item.productoid)
+        .or_else(|| erp_pum_seed(erp_item))
+        .or_else(|| infer_pum_seed(&erp_item.name))?;
+
+    if seed.ratio <= 0.0 {
+        return None;
+    }
+
+    Some(PumUpdate {
+        unity: seed.unity,
+        ratio: seed.ratio,
+        unit_price: normalize_pum_unit_price(price / seed.ratio),
+        source: seed.source,
+    })
 }
 
 async fn table_columns(
@@ -1555,9 +2110,6 @@ async fn load_prestashop_context(
         .ok()
         .or(shop_category)
         .unwrap_or(2);
-    let id_category_root = config_value(&config, "PS_ROOT_CATEGORY", "")
-        .parse::<u32>()
-        .unwrap_or(1);
     let id_groups: Vec<u32> = conn
         .query(format!(
             "SELECT id_group FROM {}group ORDER BY id_group",
@@ -1569,7 +2121,6 @@ async fn load_prestashop_context(
         id_shop,
         id_lang,
         id_category_home,
-        id_category_root,
         id_groups,
     })
 }
@@ -1725,6 +2276,518 @@ async fn ensure_category(
     Ok(id_category)
 }
 
+async fn ensure_erp_category_path(
+    conn: &mut mysql_async::Conn,
+    ctx: &PrestashopContext,
+    item: &ErpItem,
+    created_count: &mut u32,
+) -> Result<u32, Box<dyn Error>> {
+    let mut id_parent = ctx.id_category_home;
+    for group in erp_group_path(item) {
+        id_parent = ensure_category(conn, ctx, id_parent, &group, created_count).await?;
+    }
+    Ok(id_parent)
+}
+
+async fn ensure_category_path(
+    conn: &mut mysql_async::Conn,
+    ctx: &PrestashopContext,
+    path: &[String],
+    created_count: &mut u32,
+) -> Result<u32, Box<dyn Error>> {
+    let mut id_parent = ctx.id_category_home;
+    for group in path {
+        id_parent = ensure_category(conn, ctx, id_parent, group, created_count).await?;
+    }
+    Ok(id_parent)
+}
+
+async fn load_prestashop_match_keys(
+    conn: &mut mysql_async::Conn,
+) -> Result<HashSet<String>, Box<dyn Error>> {
+    let rows: Vec<(Option<String>, Option<String>)> = conn
+        .query(format!(
+            "SELECT reference, ean13 FROM {}product \
+             WHERE (reference IS NOT NULL AND reference <> '') \
+                OR (ean13 IS NOT NULL AND ean13 <> '')",
+            DB_PREFIX
+        ))
+        .await?;
+    let mut keys = HashSet::new();
+    for (reference, ean13) in rows {
+        for key in [
+            reference.unwrap_or_default().trim().to_string(),
+            ean13.unwrap_or_default().trim().to_string(),
+        ] {
+            if key.is_empty() {
+                continue;
+            }
+            keys.insert(key.clone());
+            if let Some(normalized) = normalized_numeric_key(&key) {
+                keys.insert(normalized);
+            }
+        }
+    }
+    Ok(keys)
+}
+
+async fn insert_prestashop_product(
+    conn: &mut mysql_async::Conn,
+    ctx: &PrestashopContext,
+    product: &ProductInsert,
+    id_category_default: u32,
+) -> Result<u32, Box<dyn Error>> {
+    let product_table = format!("{}product", DB_PREFIX);
+    let product_shop_table = format!("{}product_shop", DB_PREFIX);
+    let product_lang_table = format!("{}product_lang", DB_PREFIX);
+    let category_product_table = format!("{}category_product", DB_PREFIX);
+    let stock_available_table = format!("{}stock_available", DB_PREFIX);
+
+    let product_cols = table_columns(conn, &product_table).await?;
+    let product_shop_cols = table_columns(conn, &product_shop_table).await?;
+    let product_lang_cols = table_columns(conn, &product_lang_table).await?;
+    let category_product_cols = table_columns(conn, &category_product_table).await?;
+    let stock_available_cols = table_columns(conn, &stock_available_table).await?;
+
+    let reference = product_reference(&product.item);
+    let ean13 = erp_item_valid_ean13(&product.item);
+    let link_rewrite = slugify(&product.item.name);
+    let pum = product.final_pum.as_ref();
+    let unity = pum
+        .map(|pum| pum.unity.clone())
+        .unwrap_or_else(|| normalize_pum_unity(&product.item.pum_unit));
+    let unit_price = pum.map(|pum| pum.unit_price).unwrap_or(0.0);
+    let unit_price_ratio = pum.map(|pum| pum.ratio).unwrap_or(0.0);
+
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "id_category_default",
+        id_category_default.to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "id_shop_default",
+        ctx.id_shop.to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "id_tax_rules_group",
+        "0".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "reference",
+        sql_string(&reference),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "ean13",
+        sql_string(&ean13),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "price",
+        format!("{:.6}", product.final_price),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "unity",
+        sql_string(&unity),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "unit_price",
+        format!("{:.6}", unit_price),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "unit_price_ratio",
+        format!("{:.6}", unit_price_ratio),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "quantity",
+        product.final_qty.to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "minimal_quantity",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "active",
+        sql_bool(true).to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "available_for_order",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "show_price",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "visibility",
+        sql_string("both"),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "condition",
+        sql_string("new"),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "out_of_stock",
+        "2".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "state",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "product_type",
+        sql_string("standard"),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "date_add",
+        "NOW()".to_string(),
+    );
+    push_column_value(
+        &product_cols,
+        &mut columns,
+        &mut values,
+        "date_upd",
+        "NOW()".to_string(),
+    );
+    insert_dynamic(conn, &product_table, &columns, &values).await?;
+    let id_product: Option<u64> = conn.query_first("SELECT LAST_INSERT_ID()").await?;
+    let id_product: u32 = id_product
+        .ok_or("No se pudo obtener LAST_INSERT_ID() de producto")?
+        .try_into()?;
+
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "id_product",
+        id_product.to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "id_shop",
+        ctx.id_shop.to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "id_category_default",
+        id_category_default.to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "id_tax_rules_group",
+        "0".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "price",
+        format!("{:.6}", product.final_price),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "unity",
+        sql_string(&unity),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "unit_price",
+        format!("{:.6}", unit_price),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "unit_price_ratio",
+        format!("{:.6}", unit_price_ratio),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "active",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "available_for_order",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "show_price",
+        "1".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "visibility",
+        sql_string("both"),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "condition",
+        sql_string("new"),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "out_of_stock",
+        "2".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "date_add",
+        "NOW()".to_string(),
+    );
+    push_column_value(
+        &product_shop_cols,
+        &mut columns,
+        &mut values,
+        "date_upd",
+        "NOW()".to_string(),
+    );
+    insert_dynamic(conn, &product_shop_table, &columns, &values).await?;
+
+    let languages: Vec<u32> = conn
+        .query(format!("SELECT id_lang FROM {}lang", DB_PREFIX))
+        .await?;
+    for id_lang in languages {
+        let mut columns = Vec::new();
+        let mut values = Vec::new();
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "id_product",
+            id_product.to_string(),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "id_shop",
+            ctx.id_shop.to_string(),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "id_lang",
+            id_lang.to_string(),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "name",
+            sql_string(&product.item.name),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "link_rewrite",
+            sql_string(&link_rewrite),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "meta_title",
+            sql_string(&product.item.name),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "description",
+            sql_string(""),
+        );
+        push_column_value(
+            &product_lang_cols,
+            &mut columns,
+            &mut values,
+            "description_short",
+            sql_string(""),
+        );
+        insert_dynamic(conn, &product_lang_table, &columns, &values).await?;
+    }
+
+    let position: Option<u32> = conn
+        .exec_first(
+            format!(
+                "SELECT COALESCE(MAX(position), -1) + 1 \
+                 FROM {}category_product WHERE id_category = :id_category",
+                DB_PREFIX
+            ),
+            params! {
+                "id_category" => id_category_default,
+            },
+        )
+        .await?;
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    push_column_value(
+        &category_product_cols,
+        &mut columns,
+        &mut values,
+        "id_category",
+        id_category_default.to_string(),
+    );
+    push_column_value(
+        &category_product_cols,
+        &mut columns,
+        &mut values,
+        "id_product",
+        id_product.to_string(),
+    );
+    push_column_value(
+        &category_product_cols,
+        &mut columns,
+        &mut values,
+        "position",
+        position.unwrap_or(0).to_string(),
+    );
+    insert_dynamic(conn, &category_product_table, &columns, &values).await?;
+
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "id_product",
+        id_product.to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "id_product_attribute",
+        "0".to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "id_shop",
+        ctx.id_shop.to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "id_shop_group",
+        "0".to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "quantity",
+        product.final_qty.to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "physical_quantity",
+        product.final_qty.to_string(),
+    );
+    push_column_value(
+        &stock_available_cols,
+        &mut columns,
+        &mut values,
+        "out_of_stock",
+        "2".to_string(),
+    );
+    insert_dynamic(conn, &stock_available_table, &columns, &values).await?;
+
+    Ok(id_product)
+}
+
 async fn regenerate_category_tree(conn: &mut mysql_async::Conn) -> Result<(), Box<dyn Error>> {
     let rows: Vec<(u32, u32)> = conn
         .query(format!(
@@ -1840,11 +2903,138 @@ async fn load_prestashop_category_groups(
         .collect())
 }
 
+async fn load_prestashop_category_paths(
+    conn: &mut mysql_async::Conn,
+) -> Result<Vec<PrestashopCategoryPath>, Box<dyn Error>> {
+    let query = format!(
+        "SELECT \
+            CASE \
+                WHEN c.id_parent IS NULL OR c.id_parent <= 2 THEN COALESCE(cl.name, '') \
+                ELSE COALESCE(parent_cl.name, '') \
+            END AS grupo_prestashop, \
+            CASE \
+                WHEN c.id_parent IS NULL OR c.id_parent <= 2 THEN '' \
+                ELSE COALESCE(cl.name, '') \
+            END AS subgrupo_prestashop, \
+            COUNT(DISTINCT cp.id_product) AS productos \
+         FROM {}category c \
+         INNER JOIN {}category_lang cl ON cl.id_category = c.id_category \
+            AND cl.id_shop = 1 \
+            AND cl.id_lang = (SELECT CAST(value AS UNSIGNED) FROM {}configuration WHERE name = 'PS_LANG_DEFAULT' LIMIT 1) \
+         LEFT JOIN {}category parent_c ON parent_c.id_category = c.id_parent \
+         LEFT JOIN {}category_lang parent_cl ON parent_cl.id_category = parent_c.id_category \
+            AND parent_cl.id_shop = 1 \
+            AND parent_cl.id_lang = (SELECT CAST(value AS UNSIGNED) FROM {}configuration WHERE name = 'PS_LANG_DEFAULT' LIMIT 1) \
+         LEFT JOIN {}category_product cp ON cp.id_category = c.id_category \
+         WHERE c.active = 1 \
+         GROUP BY grupo_prestashop, subgrupo_prestashop \
+         HAVING productos > 0",
+        DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX
+    );
+
+    let rows: Vec<(Option<String>, Option<String>, u64)> = conn.query(query).await?;
+    let mut paths = Vec::new();
+    for (group, subgroup, _) in rows {
+        let group = group.unwrap_or_default().trim().to_string();
+        let subgroup = subgroup.unwrap_or_default().trim().to_string();
+        if group.is_empty() || is_numeric_erp_category_name(&group) {
+            continue;
+        }
+        if !subgroup.is_empty() && is_numeric_erp_category_name(&subgroup) {
+            continue;
+        }
+        let mut token_text = group.clone();
+        token_text.push(' ');
+        token_text.push_str(&subgroup);
+        let tokens = tokenize_category_text(&token_text);
+        if tokens.is_empty() {
+            continue;
+        }
+        paths.push(PrestashopCategoryPath {
+            group,
+            subgroup,
+            tokens,
+        });
+    }
+
+    Ok(paths)
+}
+
+fn write_postgresql_schema(path: &str) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "CREATE SCHEMA IF NOT EXISTS mercaboy_sync;\n\
+         CREATE TABLE IF NOT EXISTS mercaboy_sync.product_proposals (\n\
+           batch_at timestamptz NOT NULL DEFAULT now(),\n\
+           action text NOT NULL,\n\
+           proposal_reason text NOT NULL DEFAULT '',\n\
+           id_product_erp text NOT NULL,\n\
+           id_product_prestashop integer NOT NULL DEFAULT 0,\n\
+           name_prestashop text NOT NULL DEFAULT '',\n\
+           name_erp text NOT NULL DEFAULT '',\n\
+           reference text NOT NULL DEFAULT '',\n\
+           ean13 text NOT NULL DEFAULT '',\n\
+           category_group text NOT NULL DEFAULT '',\n\
+           category_subgroup text NOT NULL DEFAULT '',\n\
+           erp_created_at text NOT NULL DEFAULT '',\n\
+           income numeric(18,4) NOT NULL DEFAULT 0,\n\
+           contribution numeric(18,4) NOT NULL DEFAULT 0,\n\
+           income_contribution_score numeric(22,4) NOT NULL DEFAULT 0,\n\
+           qty integer,\n\
+           price numeric(18,6),\n\
+           last_purchase_at text NOT NULL DEFAULT '',\n\
+           raw_price_lists text NOT NULL DEFAULT '',\n\
+           PRIMARY KEY (batch_at, action, id_product_erp, id_product_prestashop)\n\
+         );\n\
+         CREATE INDEX IF NOT EXISTS product_proposals_action_score_idx\n\
+           ON mercaboy_sync.product_proposals (action, income_contribution_score DESC);"
+    )?;
+    Ok(())
+}
+
+fn write_postgresql_proposals_csv(path: &str, rows: &[AuditRow]) -> Result<(), Box<dyn Error>> {
+    let mut file = File::create(path)?;
+    writeln!(
+        file,
+        "action,proposal_reason,id_product_erp,id_product_prestashop,name_prestashop,name_erp,reference,ean13,category_group,category_subgroup,erp_created_at,income,contribution,income_contribution_score,qty,price,last_purchase_at,raw_price_lists"
+    )?;
+    for row in rows
+        .iter()
+        .filter(|row| row.action == "PRODUCTO_PARA_CREAR" || row.action.starts_with("PROPONER_RETIRAR"))
+    {
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{}",
+            csv_escape(&row.action),
+            csv_escape(&row.proposal_reason),
+            csv_escape(&row.id_product_erp),
+            row.id_product_mariadb,
+            csv_escape(&row.name),
+            csv_escape(&row.erp_name),
+            csv_escape(&row.reference),
+            csv_escape(&row.ean13),
+            csv_escape(&row.ps_group),
+            csv_escape(&row.ps_subgroup),
+            csv_escape(&row.erp_created_at),
+            row.income,
+            row.contribution,
+            row.contribution_score,
+            fmt_qty(row.sync_final_qty),
+            fmt_price(row.price_for_mariadb),
+            csv_escape(&row.last_purchase_date),
+            csv_escape(&row.price_lists)
+        )?;
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let total_start = Instant::now();
     let args: Vec<String> = std::env::args().collect();
     let apply_changes = args.iter().any(|arg| arg == "--apply");
+    let contribution_report_only = args.iter().any(|arg| arg == "--contribution-report");
     let audit_only = !apply_changes;
 
     println!(
@@ -1890,6 +3080,26 @@ async fn main() -> Result<(), Box<dyn Error>> {
             LOCAL_ENV_CONFIG
         )
         .into());
+    }
+
+    println!(
+        "Destino MariaDB                 : {}:{} / {}",
+        mariadb_host, mariadb_port, mariadb_db
+    );
+
+    if apply_changes && is_protected_mariadb_host(&mariadb_host) {
+        let allow_production_apply = std::env::var("ALLOW_PRODUCTION_APPLY")
+            .ok()
+            .map(|value| value == "YES")
+            .unwrap_or(false);
+        if !allow_production_apply {
+            return Err(format!(
+                "Bloqueado por seguridad: --apply apunta a MariaDB protegido ({}). \
+                 Para produccion se requiere ALLOW_PRODUCTION_APPLY=YES.",
+                mariadb_host
+            )
+            .into());
+        }
     }
 
     let connection_url = format!(
@@ -1967,6 +3177,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|days| days.parse().ok())
         .filter(|days| *days > 0)
         .unwrap_or(60);
+    let contribution_window_days: i32 = local_config
+        .get("contribution_window_days")
+        .or_else(|| local_config.get("ventana_contribucion_dias"))
+        .and_then(|days| days.parse().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(30);
+    let new_product_window_days: i64 = local_config
+        .get("new_product_window_days")
+        .or_else(|| local_config.get("ventana_productos_nuevos_dias"))
+        .and_then(|days| days.parse().ok())
+        .filter(|days| *days > 0)
+        .unwrap_or(DEFAULT_NEW_PRODUCT_WINDOW_DAYS);
     let purchase_movement_host = local_config
         .get("purchase_movement_host")
         .cloned()
@@ -1982,6 +3204,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "Consulta ultima compra/ingreso: historica en {} (ventana {} dias solo informativa)",
         purchase_movement_host, purchase_movement_window_days
+    );
+    println!(
+        "Consulta contribucion marginal: ventana {} dias configurables",
+        contribution_window_days
+    );
+    println!(
+        "Productos ERP recientes: ventana {} dias configurable",
+        new_product_window_days
     );
     let pum_plan_path = local_config
         .get("pum_plan_path")
@@ -2019,6 +3249,48 @@ async fn main() -> Result<(), Box<dyn Error>> {
             .get(position + 1)
             .ok_or("--inspect-product requiere un codigo de producto")?;
         inspect_erp_product(&sync_host, &erp_connection, product_code).await?;
+        return Ok(());
+    }
+    if contribution_report_only {
+        let contribution_report = load_contribution_margins(
+            &purchase_movement_host,
+            &erp_connection,
+            contribution_window_days,
+        )
+        .await?;
+        let contrib_start = Instant::now();
+        let contrib_name = "ContribucionMarginalIngresoContribucion.csv";
+        let mut contrib_csv = File::create(contrib_name)?;
+        writeln!(
+            contrib_csv,
+            "productoid,nombre,referencia,ean13,ingreso,costo,contribucion,ventana_dias,servidor_sync"
+        )?;
+        for row in &contribution_report {
+            let contribucion = row.income - row.cost;
+            writeln!(
+                contrib_csv,
+                "{},{},{},{},{:.4},{:.4},{:.4},{},{}",
+                csv_escape(&row.productoid),
+                csv_escape(&row.name),
+                csv_escape(&row.reference),
+                csv_escape(&row.ean13),
+                row.income,
+                row.cost,
+                contribucion,
+                contribution_window_days,
+                csv_escape(&purchase_movement_host)
+            )?;
+        }
+        println!("Archivo CSV generado: {}", contrib_name);
+        println!(
+            "Productos con ingreso/contribucion en los ultimos {} dias: {}",
+            contribution_window_days,
+            contribution_report.len()
+        );
+        println!(
+            "Tiempo reporte contribucion : {} ms",
+            contrib_start.elapsed().as_millis()
+        );
         return Ok(());
     }
 
@@ -2076,7 +3348,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Encontrados {} productos activos en PrestaShop.",
         ps_products.len()
     );
+    let prestashop_context = load_prestashop_context(&mut conn).await?;
+    let prestashop_match_keys = load_prestashop_match_keys(&mut conn).await?;
+    println!(
+        "Claves de productos existentes en PrestaShop para evitar duplicados: {}",
+        prestashop_match_keys.len()
+    );
     let ps_category_groups = load_prestashop_category_groups(&mut conn).await?;
+    let ps_category_paths = load_prestashop_category_paths(&mut conn).await?;
+    println!(
+        "Rutas de categorias PrestaShop utiles para inferencia: {}",
+        ps_category_paths.len()
+    );
     let products_ms = products_start.elapsed().as_millis();
 
     let almacenes_list: Vec<String> = almacenes_str
@@ -2114,6 +3397,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "Productos con ultima compra/ingreso historico desde {}: {}",
         purchase_movement_host,
         purchase_info_by_product.len()
+    );
+
+    let contribution_report =
+        load_contribution_margins(&purchase_movement_host, &erp_connection, contribution_window_days)
+            .await?;
+    println!(
+        "Productos con ingreso/contribucion en los ultimos {} dias: {}",
+        contribution_window_days,
+        contribution_report.len()
+    );
+    let contribution_by_product = proposal_metric_by_product(&contribution_report);
+    let top_insert_productoids =
+        top_productoids_by_score(&contribution_report, DEFAULT_INSERT_TOP_PERCENT);
+    let bottom_withdraw_productoids =
+        bottom_productoids_by_score(&contribution_report, DEFAULT_WITHDRAW_BOTTOM_PERCENT);
+    println!(
+        "Candidatos por 50% superior ingreso*contribucion: {}",
+        top_insert_productoids.len()
+    );
+    println!(
+        "Candidatos para retirar por 5% inferior ingreso*contribucion: {}",
+        bottom_withdraw_productoids.len()
     );
 
     let pending_start = Instant::now();
@@ -2187,6 +3492,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let audit_calc_start = Instant::now();
     let mut products_to_update: Vec<ProductUpdate> = Vec::new();
+    let mut products_to_insert: Vec<ProductInsert> = Vec::new();
     let mut audit_rows: Vec<AuditRow> = Vec::new();
     let mut skipped_count = 0u32;
     let mut matched_by_ean = 0u32;
@@ -2342,6 +3648,20 @@ async fn main() -> Result<(), Box<dyn Error>> {
             )
         };
 
+        let metric = contribution_by_product.get(&erp_productoid);
+        let income = metric.map(|row| row.income).unwrap_or(0.0);
+        let contribution = metric.map(contribution_value).unwrap_or(0.0);
+        let contribution_score_value = metric.map(contribution_score).unwrap_or(0.0);
+        let mut action = action;
+        let mut proposal_reason = String::new();
+        if !erp_productoid.is_empty()
+            && bottom_withdraw_productoids.contains(&erp_productoid)
+            && action == "SIN_CAMBIO"
+        {
+            action = "PROPONER_RETIRAR_BAJO_INGRESO_CONTRIBUCION".to_string();
+            proposal_reason = "5_PORCIENTO_INFERIOR_INGRESO_X_CONTRIBUCION".to_string();
+        }
+
         let purchase_info = purchase_info_by_product
             .get(&erp_productoid)
             .cloned()
@@ -2401,6 +3721,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
             last_purchase_date: purchase_info.date,
             last_purchase_qty: purchase_info.qty,
             last_purchase_value: purchase_info.value,
+            erp_created_at: sync_item
+                .map(|item| item.created_at.clone())
+                .unwrap_or_default(),
+            income,
+            contribution,
+            contribution_score: contribution_score_value,
+            proposal_reason,
             action,
         });
     }
@@ -2411,10 +3738,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
             continue;
         }
 
+        let exists_in_prestashop = erp_item_match_keys(erp_item)
+            .iter()
+            .any(|key| prestashop_match_keys.contains(key));
+        if exists_in_prestashop {
+            continue;
+        }
+
+        let metric = contribution_by_product.get(&erp_item.productoid);
+        let income = metric.map(|row| row.income).unwrap_or(0.0);
+        let contribution = metric.map(contribution_value).unwrap_or(0.0);
+        let contribution_score_value = metric.map(contribution_score).unwrap_or(0.0);
+        let is_top_performer = top_insert_productoids.contains(&erp_item.productoid);
+        let is_recent = is_recent_erp_item(erp_item, new_product_window_days);
+        if !is_top_performer && !is_recent {
+            continue;
+        }
+        let proposal_reason = if is_recent && is_top_performer {
+            format!(
+                "50_PORCIENTO_SUPERIOR_Y_RECIEN_CREADO_{}D",
+                new_product_window_days
+            )
+        } else if is_recent {
+            format!("RECIEN_CREADO_ERP_{}D", new_product_window_days)
+        } else {
+            "50_PORCIENTO_SUPERIOR_INGRESO_X_CONTRIBUCION".to_string()
+        };
+        let category_path = inferred_category_path(erp_item, &ps_category_paths);
         let purchase_info = purchase_info_by_product
             .get(&erp_item.productoid)
             .cloned()
             .unwrap_or_default();
+        let final_price = erp_item.sales_price.unwrap_or(0.0);
+        let final_qty = erp_item.qty.floor().max(0.0) as i32;
+        products_to_insert.push(ProductInsert {
+            item: erp_item.clone(),
+            final_qty,
+            final_price,
+            final_pum: resolve_pum_update_for_new(erp_item, erp_item.sales_price, &pum_plan),
+            category_path: category_path.clone(),
+            proposal_reason: proposal_reason.clone(),
+        });
 
         audit_rows.push(AuditRow {
             id_product_erp: erp_item.productoid.clone(),
@@ -2428,10 +3792,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             mariadb_unit: normalize_unit(&erp_item.unit),
             conversion_factor: 1.0,
             stock_prod: Some(erp_item.qty),
-            inventory_for_mariadb: Some(erp_item.qty.floor().max(0.0) as i32),
+            inventory_for_mariadb: Some(final_qty),
             stock_mariadb: 0,
             pending_qty: 0,
-            sync_final_qty: Some(erp_item.qty.floor().max(0.0) as i32),
+            sync_final_qty: Some(final_qty),
             price_mariadb: 0.0,
             price_erp: erp_item.sales_price,
             price_for_mariadb: erp_item.sales_price,
@@ -2445,11 +3809,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             erp_group_level_4: erp_item.erp_group_level_4.clone(),
             erp_group_level_6: erp_item.erp_group_level_6.clone(),
             erp_group_level_7: erp_item.erp_group_level_7.clone(),
-            ps_group: String::new(),
-            ps_subgroup: String::new(),
+            ps_group: category_path.get(0).cloned().unwrap_or_default(),
+            ps_subgroup: category_path.get(1).cloned().unwrap_or_default(),
             last_purchase_date: purchase_info.date,
             last_purchase_qty: purchase_info.qty,
             last_purchase_value: purchase_info.value,
+            erp_created_at: erp_item.created_at.clone(),
+            income,
+            contribution,
+            contribution_score: contribution_score_value,
+            proposal_reason,
             action: "PRODUCTO_PARA_CREAR".to_string(),
         });
     }
@@ -2470,6 +3839,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "Registros que serian actualizados : {}",
         products_to_update.len()
+    );
+    println!(
+        "Productos ERP para crear en PS    : {}",
+        products_to_insert.len()
     );
     println!(
         "Modo                              : {}",
@@ -2532,6 +3905,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sync_host
     );
     println!(
+        "Auditoria detecto {} productos ERP nuevos para insertar en PrestaShop.",
+        products_to_insert.len()
+    );
+    println!(
         "De {} productos activos, {} requieren actualizar stock, precio y/o PUM.",
         ps_products.len(),
         products_to_update.len()
@@ -2546,13 +3923,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut csv = File::create(&csv_name)?;
     writeln!(
         csv,
-        "id_product_erp,id_product_mariadb,nombre_prestashop,nombre_erp,referencia,ean13,codigo_match,grupo_erp_nivel_1,grupo_erp_nivel_2,grupo_erp_nivel_4,grupo_erp_nivel_6,grupo_erp_nivel_7,grupo_prestashop,subgrupo_prestashop,unidad_erp,unidad_mariadb_inferida,factor_conversion_precio,inventario_erp_192_168_0_231,inventario_para_mariadb,inventario_mariadb,pendiente,final_sync,precio_mariadb,precio_erp,precio_para_mariadb,pum_fuente,pum_unidad,pum_ratio,pum_precio_unitario,otras_listas_precios_erp,servidor_sync,fecha_ultima_compra_erp,cantidad_ultima_compra_erp,valor_ultima_compra_erp,accion"
+        "id_product_erp,id_product_mariadb,nombre_prestashop,nombre_erp,referencia,ean13,codigo_match,grupo_erp_nivel_1,grupo_erp_nivel_2,grupo_erp_nivel_4,grupo_erp_nivel_6,grupo_erp_nivel_7,grupo_prestashop,subgrupo_prestashop,unidad_erp,unidad_mariadb_inferida,factor_conversion_precio,inventario_erp_192_168_0_231,inventario_para_mariadb,inventario_mariadb,pendiente,final_sync,precio_mariadb,precio_erp,precio_para_mariadb,pum_fuente,pum_unidad,pum_ratio,pum_precio_unitario,otras_listas_precios_erp,servidor_sync,fecha_ultima_compra_erp,cantidad_ultima_compra_erp,valor_ultima_compra_erp,fecha_creacion_erp,ingreso,contribucion,score_ingreso_contribucion,motivo_propuesta,accion"
     )?;
 
     for row in &audit_rows {
         writeln!(
             csv,
-            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{:.6},{},{},{},{},{},{:.2},{},{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{}",
             csv_escape(&row.id_product_erp),
             row.id_product_mariadb,
             csv_escape(&row.name),
@@ -2587,15 +3964,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
             csv_escape(&row.last_purchase_date),
             csv_escape(&row.last_purchase_qty),
             csv_escape(&row.last_purchase_value),
+            csv_escape(&row.erp_created_at),
+            row.income,
+            row.contribution,
+            row.contribution_score,
+            csv_escape(&row.proposal_reason),
             row.action
         )?;
     }
 
     println!("Archivo CSV generado: {}", csv_name);
+    let pg_schema_name = "postgresql_propuestas_schema.sql";
+    let pg_csv_name = "postgresql_propuestas_productos.csv";
+    write_postgresql_schema(pg_schema_name)?;
+    write_postgresql_proposals_csv(pg_csv_name, &audit_rows)?;
+    println!(
+        "Artefactos PostgreSQL generados: {}, {}",
+        pg_schema_name, pg_csv_name
+    );
     let csv_ms = csv_start.elapsed().as_millis();
+
+    let contrib_start = Instant::now();
+    let contrib_name = "ContribucionMarginalIngresoContribucion.csv";
+    let mut contrib_csv = File::create(contrib_name)?;
+    writeln!(
+        contrib_csv,
+        "productoid,nombre,referencia,ean13,ingreso,costo,contribucion,ventana_dias,servidor_sync"
+    )?;
+    for row in &contribution_report {
+        let contribucion = row.income - row.cost;
+        writeln!(
+            contrib_csv,
+            "{},{},{},{},{:.4},{:.4},{:.4},{},{}",
+            csv_escape(&row.productoid),
+            csv_escape(&row.name),
+            csv_escape(&row.reference),
+            csv_escape(&row.ean13),
+            row.income,
+            row.cost,
+            contribucion,
+            contribution_window_days,
+            csv_escape(&purchase_movement_host)
+        )?;
+    }
+    println!("Archivo CSV generado: {}", contrib_name);
+    let contrib_ms = contrib_start.elapsed().as_millis();
 
     let update_start = Instant::now();
     let mut updated_count = 0;
+    let mut inserted_count = 0u32;
+    let mut created_category_count = 0u32;
     if audit_only {
         println!(
             "MODO AUDITORIA: se omitio la actualizacion. Revise el CSV y ejecute con --apply para aplicar."
@@ -2767,6 +4185,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
             updated_count += chunk.len();
             tx.commit().await?;
         }
+
+        for product in &products_to_insert {
+            let id_category_default = ensure_erp_category_path(
+                &mut conn,
+                &prestashop_context,
+                &product.item,
+                &mut created_category_count,
+            )
+            .await?;
+            let id_product = insert_prestashop_product(
+                &mut conn,
+                &prestashop_context,
+                product,
+                id_category_default,
+            )
+            .await?;
+            inserted_count += 1;
+            println!(
+                "Producto ERP {} insertado en PrestaShop como id_product {}.",
+                product.item.productoid, id_product
+            );
+        }
+
+        if created_category_count > 0 {
+            regenerate_category_tree(&mut conn).await?;
+        }
     }
     let update_ms = update_start.elapsed().as_millis();
 
@@ -2790,6 +4234,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             params! { "updated" => updated_count.to_string() },
         )
         .await?;
+
+        conn.exec_drop(
+            format!(
+                "UPDATE {}configuration SET value = :inserted WHERE name = 'MERCABOY_ERP_LAST_BATCH_INSERTED'",
+                DB_PREFIX
+            ),
+            params! { "inserted" => inserted_count.to_string() },
+        )
+        .await?;
     }
     let metadata_ms = metadata_start.elapsed().as_millis();
 
@@ -2800,8 +4253,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         );
     } else {
         println!(
-            "Sincronizacion finalizada correctamente: {} actualizados, {} omitidos (sin cambios o sin match).",
-            updated_count, skipped_count
+            "Sincronizacion finalizada correctamente: {} actualizados, {} insertados, {} categorias creadas, {} omitidos (sin cambios o sin match).",
+            updated_count, inserted_count, created_category_count, skipped_count
         );
     }
     println!();
@@ -2815,6 +4268,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("Pendientes PrestaShop     : {}", pending_ms);
     println!("Calculo auditoria         : {}", audit_calc_ms);
     println!("CSV auditoria             : {}", csv_ms);
+    println!("CSV contribucion          : {}", contrib_ms);
     println!("Actualizacion MariaDB     : {}", update_ms);
     println!("Metadata batch            : {}", metadata_ms);
     println!(
