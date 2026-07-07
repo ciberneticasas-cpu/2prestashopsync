@@ -43,3 +43,4 @@ settings.local.toml
 .DS_Store
 Thumbs.db
 node_modules/
+node_modules/
