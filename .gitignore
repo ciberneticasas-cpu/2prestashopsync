@@ -1,6 +1,6 @@
 # Compilación de Rust
 /target/
-/node_modules/
+node_modules/
 
 # Archivo de lock (depende del tipo de proyecto)
 # Mantenerlo si es una aplicación
@@ -42,3 +42,4 @@ settings.local.toml
 # Archivos del sistema
 .DS_Store
 Thumbs.db
+node_modules/
