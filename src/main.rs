@@ -25,7 +25,7 @@ use utils::{
 use pum::{load_pum_plan, pum_is_different, resolve_pum_update};
 
 use erp::{
-    inspect_erp_product, inspect_erp_schema, inspect_purchase_schema, load_erp_stock,
+    inspect_erp_product, load_erp_stock,
     lookup_stock_by_reference,
 };
 
@@ -206,14 +206,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
     let config_ms = config_start.elapsed().as_millis();
 
-    if args.iter().any(|arg| arg == "--inspect-erp-schema") {
-        inspect_erp_schema(&erp_host, &erp_connection).await?;
-        return Ok(());
-    }
-    if args.iter().any(|arg| arg == "--inspect-purchase-schema") {
-        inspect_purchase_schema(&erp_host, &erp_connection).await?;
-        return Ok(());
-    }
     if let Some(position) = args.iter().position(|arg| arg == "--inspect-product") {
         let product_code = args
             .get(position + 1)
